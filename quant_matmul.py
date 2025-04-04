@@ -1,29 +1,30 @@
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 
-class QLinear(nn.Module):
+def quant_matmul(x, weight_int8, scale, zero, bias=None):
     """
-    Simulated quantized linear layer: W_int4 * scale
+    Perform quantized matrix multiplication: (x @ dequantized(weight)) + bias
+    Args:
+        x: [batch, in_features] (float16/bfloat16)
+        weight_int8: [out_features, in_features] (uint8)
+        scale: [out_features, in_features] (float32)
+        zero: [out_features, in_features] (float32)
+        bias: [out_features] (float32 or None)
+    Returns:
+        output: [batch, out_features]
     """
-    def __init__(self, weight_int4, scale):
-        super().__init__()
-        self.register_buffer("W_q", weight_int4)  # shape [out, in] int8 simulating int4
-        self.register_buffer("scale", scale)      # shape [out]
+    x = x.to(torch.float16)
+    scale = scale.to(x.device)
+    zero = zero.to(x.device)
 
-    def forward(self, x):
-        W_fp = self.W_q.float() * self.scale.view(-1, 1)  # dequantize row-wise
-        return torch.matmul(x, W_fp.T)
+    # Debugging assertion
+    assert weight_int8.shape == scale.shape == zero.shape, (
+        f"Shape mismatch: weight_int8={weight_int8.shape}, scale={scale.shape}, zero={zero.shape}"
+    )
 
+    # Dequantize
+    weight = (weight_int8.to(torch.float16) - zero) * scale
+    weight = weight.to(x.device)
 
-if __name__ == "__main__":
-    torch.manual_seed(42)
-    batch, in_features, out_features = 2, 16, 4
-    X = torch.randn(batch, in_features)
-    W_real = torch.randn(out_features, in_features)
-    scale = (2 ** 4 - 1) / W_real.abs().max(dim=1).values
-    W_q = (W_real * scale.view(-1, 1)).round().clamp(-8, 7).to(torch.int8)
-
-    qlinear = QLinear(W_q, scale)
-    Y = qlinear(X)
-
-    print("[Quant] Simulated output:", Y)
+    out = F.linear(x, weight, bias)
+    return out
