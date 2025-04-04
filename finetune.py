@@ -1,4 +1,5 @@
 import os
+import argparse
 import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
@@ -8,7 +9,7 @@ from gptq_quantizer import quantize_model_weights
 from dataset_loader import GSM8KCoTDataset
 import torch.nn.functional as F
 
-def train_lora_model():
+def train_lora_model(batch_size=2, epochs=1):
     model_name = "meta-llama/Llama-2-7b-hf"
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
     tokenizer.pad_token = tokenizer.eos_token
@@ -69,4 +70,9 @@ def train_lora_model():
     print("[Training complete] Adapter saved.")
 
 if __name__ == "__main__":
-    train_lora_model()
+    # sample usage >>> python finetune.py --batch_size 2 --epochs 1
+    parser = argparse.ArgumentParser(description="Quantize and Train LoRA model")
+    parser.add_argument("--batch_size", type=int, default=2, help="Batch size for training")
+    parser.add_argument("--epochs", type=int, default=1, help="Number of epochs for training")
+    args = parser.parse_args()
+    train_lora_model(batch_size=args.batch_size, epochs=args.epochs)
