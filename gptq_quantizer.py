@@ -1,104 +1,249 @@
 import torch
 import torch.nn as nn
-from collections import defaultdict
-from quant_matmul import QLinear
+import torch.nn.functional as F
+from quant_matmul import quant_matmul
 
 class GPTQQuantizer:
-    def __init__(self, model, layer_names, bits=4, group_size=64):
-        self.model = model.eval()
-        self.layer_names = layer_names
+    def __init__(self, layer, block_size=64, bits=8):
+        self.layer = layer
+        self.block_size = block_size
         self.bits = bits
-        self.group_size = group_size
-        self.activation_cache = defaultdict(list)
-        self.quantized_weights = {}
-        self.scales = {}
+        self.max_int = 2 ** bits - 1
+        self.device = layer.weight.device
 
-    def _register_hooks(self):
-        for name, module in self.model.named_modules():
-            if name in self.layer_names:
-                module.register_forward_hook(self._capture_hook(name))
+        self.W = layer.weight.data.clone().to(torch.float32)
+        self.in_features = self.W.shape[1]
+        self.out_features = self.W.shape[0]
 
-    def _capture_hook(self, name):
-        def hook(module, input, output):
-            self.activation_cache[name].append(input[0].detach().cpu())
-        return hook
+        self.H = torch.zeros((self.in_features, self.in_features), dtype=torch.float32, device=self.device)
+        self.A = []
 
-    def collect_activations(self, dataloader, device="cuda", max_batches=50):
-        self._register_hooks()
-        self.model.to(device)
+    def add_batch(self, inputs):
+        inputs = inputs.view(-1, inputs.shape[-1])
+        self.A.append(inputs.detach())
 
-        with torch.no_grad():
-            for i, batch in enumerate(dataloader):
-                if i >= max_batches:
-                    break
-                input_ids = batch["input_ids"].to(device)
-                attention_mask = batch["attention_mask"].to(device)
-                _ = self.model(input_ids=input_ids, attention_mask=attention_mask)
+    def compute_hessian(self):
+        A = torch.cat(self.A, dim=0)
+        self.H = (A.T @ A).float()
+        self.H += torch.eye(self.H.shape[0], device=self.device, dtype=torch.float32) * 1e-5  # Regularization
 
-    def _approximate_hessian(self, A):
-        # A is (N x d), we return (d x d)
-        return A.T @ A
+    def quantize(self):
+        W = self.W
+        H = self.H
+        block_size = self.block_size
 
-    def quantize_layer(self, layer_name):
-        layer = dict(self.model.named_modules())[layer_name]
-        W = layer.weight.data.clone().cpu()  # (out x in)
-        A = torch.cat(self.activation_cache[layer_name], dim=0).cpu()  # (N x in)
+        W_quant = torch.zeros_like(W)
+        scale_list = []
+        zero_list = []
 
-        H = self._approximate_hessian(A)  # (in x in)
-        W_q = torch.zeros_like(W)
-        scales = torch.zeros(W.size(0))
+        for i in range(0, W.shape[1], block_size):
+            end = min(i + block_size, W.shape[1])
+            W_block = W[:, i:end]  # (out, block)
 
-        for i in range(0, W.size(0), self.group_size):
-            block_rows = W[i:i+self.group_size]
-            block_H = H + 1e-4 * torch.eye(H.size(0))  # regularization
-
+            # H_block = H[i:end, i:end]
+            H_block = H[i:end, i:end].float()
             try:
-                L = torch.linalg.cholesky(block_H)
+                H_inv = torch.linalg.inv(H_block)
             except:
-                L = torch.eye(H.size(0))
+                H_inv = torch.pinverse(H_block)
 
-            for j in range(block_rows.size(0)):
-                idx = i + j
-                w_i = block_rows[j].clone()
-                max_val = w_i.abs().max()
+            proj = W_block @ H_inv @ H_block  # projection
 
-                if max_val < 1e-5:
-                    scales[idx] = 1.0
-                    W_q[idx] = 0.0
-                    continue
+            W_min = proj.min(dim=1, keepdim=True)[0]
+            W_max = proj.max(dim=1, keepdim=True)[0]
+            scale = (W_max - W_min) / self.max_int
+            scale[scale == 0] = 1e-6
+            zero = torch.round(-W_min / scale)
+            W_q = torch.round(proj / scale + zero).clamp(0, self.max_int)
 
-                s_i = (2 ** self.bits - 1) / max_val
-                q_i = torch.clamp((w_i * s_i).round(), -2 ** (self.bits - 1), 2 ** (self.bits - 1) - 1)
-                W_q[idx] = q_i / s_i
-                scales[idx] = s_i
+            dequant = (W_q - zero) * scale
+            residual = W_block - dequant
 
-                # Error feedback
-                error = w_i - W_q[idx]
-                correction = torch.cholesky_solve(error.unsqueeze(1), L).squeeze(1)
-                if j + 1 < block_rows.size(0):
-                    block_rows[j + 1] += correction * 0.1
+            # Backsolve error propagation
+            if end < W.shape[1]:
+                W[:, end:] -= residual @ H[i:end, end:]
 
-        self.quantized_weights[layer_name] = W_q
-        self.scales[layer_name] = scales
+            W_quant[:, i:end] = W_q
 
-    def apply_quantization(self):
-        for name in self.layer_names:
-            self.quantize_layer(name)
-            layer = dict(self.model.named_modules())[name]
+            scale = scale.expand(-1, W_block.shape[1])
+            zero = zero.expand(-1, W_block.shape[1])
 
-            qlinear = QLinear(
-                self.quantized_weights[name].to(layer.weight.device).to(torch.int8),
-                self.scales[name].to(layer.weight.device)
-            )
-            parent = self.model
-            parts = name.split(".")
-            for p in parts[:-1]:
-                parent = getattr(parent, p)
-            setattr(parent, parts[-1], qlinear)
+            scale_list.append(scale)
+            zero_list.append(zero)
 
-    def save(self, path="quantized_model.pt"):
-        torch.save({
-            "quantized_weights": self.quantized_weights,
-            "scales": self.scales
-        }, path)
-        print(f"[GPTQ] Quantized weights saved to {path}")
+        self.W_int8 = W_quant.to(torch.uint8)
+        self.scales = torch.cat(scale_list, dim=1)
+        self.zeros = torch.cat(zero_list, dim=1)
+
+        return self.W_int8, self.scales, self.zeros
+
+
+class QuantizedLinear(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.bias_flag = bias
+        self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
+
+    def load_quantized(self, W_int8, scales, zeros):
+        self.register_buffer("weight_quant", W_int8)
+        self.register_buffer("scale", scales)
+        self.register_buffer("zero", zeros)
+
+    def forward(self, x):
+        return quant_matmul(x, self.weight_quant, self.scale, self.zero, bias=self.bias)
+
+
+@torch.no_grad()
+def quantize_model_weights(model, dataloader, num_batches=10):
+    print("[GPTQ] Starting full quantization...")
+
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear) and any(k in name for k in ["q_proj", "k_proj", "v_proj", "o_proj"]):
+            print(f"Quantizing {name}...")
+            quantizer = GPTQQuantizer(module)
+
+            count = 0
+            for batch in dataloader:
+                if count >= num_batches:
+                    break
+                input_ids = batch["input_ids"].to(module.weight.device)
+
+
+                # with torch.no_grad():
+                hidden = model.model.embed_tokens(input_ids)
+
+
+                quantizer.add_batch(hidden)
+                count += 1
+
+            quantizer.compute_hessian()
+            W_q, scales, zeros = quantizer.quantize()
+
+            qlinear = QuantizedLinear(module.in_features, module.out_features, bias=module.bias is not None)
+            qlinear.load_quantized(W_q, scales, zeros)
+            if module.bias is not None:
+                qlinear.bias.data.copy_(module.bias.data)
+
+            # Save original float weight for LoRA injection
+            qlinear.fp_weight = quantizer.W.clone()  # Save original W
+
+            # Replace original layer
+            parent = dict(model.named_modules())[name.rsplit(".", 1)[0]]
+            setattr(parent, name.rsplit(".", 1)[-1], qlinear)
+
+    return model
+
+
+
+
+
+
+
+
+# import torch
+# import torch.nn as nn
+# from quant_matmul import quant_matmul
+
+# class GPTQQuantizer:
+#     def __init__(self, layer, block_size=64, bits=8):
+#         self.layer = layer
+#         self.block_size = block_size
+#         self.bits = bits
+#         self.max_int = 2 ** bits - 1
+#         self.device = layer.weight.device
+#         self.W = layer.weight.data.clone().to(torch.float32)
+#         self.in_features = self.W.shape[1]
+#         self.out_features = self.W.shape[0]
+#         self.H = torch.zeros((self.in_features, self.in_features), dtype=torch.float32, device=self.device)
+#         self.A = []
+
+#     def add_batch(self, inputs):
+#         inputs = inputs.view(-1, inputs.shape[-1])
+#         self.A.append(inputs.detach())
+
+#     def compute_hessian(self):
+#         A = torch.cat(self.A, dim=0)
+#         self.H = (A.T @ A).float()
+#         self.H += torch.eye(self.H.shape[0], device=self.device, dtype=torch.float32) * 1e-5
+
+#     def quantize(self):
+#         W = self.W
+#         H = self.H
+#         block_size = self.block_size
+#         W_quant = torch.zeros_like(W)
+#         scale_list = []
+#         zero_list = []
+#         for i in range(0, W.shape[1], block_size):
+#             end = min(i + block_size, W.shape[1])
+#             W_block = W[:, i:end]
+#             H_block = H[i:end, i:end].float()
+#             try:
+#                 H_inv = torch.linalg.inv(H_block)
+#             except:
+#                 H_inv = torch.pinverse(H_block)
+#             proj = W_block @ H_inv @ H_block
+#             W_min = proj.min(dim=1, keepdim=True)[0]
+#             W_max = proj.max(dim=1, keepdim=True)[0]
+#             scale = (W_max - W_min) / self.max_int
+#             scale[scale == 0] = 1e-6
+#             zero = torch.round(-W_min / scale)
+#             W_q = torch.round(proj / scale + zero).clamp(0, self.max_int)
+#             dequant = (W_q - zero) * scale
+#             residual = W_block - dequant
+#             if end < W.shape[1]:
+#                 W[:, end:] -= residual @ H[i:end, end:]
+#             W_quant[:, i:end] = W_q
+#             scale = scale.expand(-1, W_block.shape[1])
+#             zero = zero.expand(-1, W_block.shape[1])
+#             scale_list.append(scale)
+#             zero_list.append(zero)
+#         self.W_int8 = W_quant.to(torch.uint8)
+#         self.scales = torch.cat(scale_list, dim=1)
+#         self.zeros = torch.cat(zero_list, dim=1)
+#         return self.W_int8, self.scales, self.zeros
+
+
+# class QuantizedLinear(nn.Module):
+#     def __init__(self, in_features, out_features, bias=True):
+#         super().__init__()
+#         self.in_features = in_features
+#         self.out_features = out_features
+#         self.bias_flag = bias
+#         self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
+
+#     def load_quantized(self, W_int8, scales, zeros):
+#         self.register_buffer("weight_quant", W_int8)
+#         self.register_buffer("scale", scales)
+#         self.register_buffer("zero", zeros)
+
+#     def forward(self, x):
+#         return quant_matmul(x, self.weight_quant, self.scale, self.zero, bias=self.bias)
+
+
+# @torch.no_grad()
+# def quantize_model_weights(model, dataloader, num_batches=10):
+#     print("[GPTQ] Starting selective quantization...")
+#     for name, module in model.named_modules():
+#         if isinstance(module, nn.Linear) and any(k in name for k in ["out_proj", "fc1", "fc2"]):
+#             print(f"Quantizing {name}...")
+#             quantizer = GPTQQuantizer(module)
+#             count = 0
+#             for batch in dataloader:
+#                 if count >= num_batches:
+#                     break
+#                 input_ids = batch["input_ids"].to(module.weight.device)
+#                 hidden = model.model.embed_tokens(input_ids)
+#                 quantizer.add_batch(hidden)
+#                 count += 1
+#             quantizer.compute_hessian()
+#             W_q, scales, zeros = quantizer.quantize()
+#             qlinear = QuantizedLinear(module.in_features, module.out_features, bias=module.bias is not None)
+#             qlinear.load_quantized(W_q, scales, zeros)
+#             if module.bias is not None:
+#                 qlinear.bias.data.copy_(module.bias.data)
+#             qlinear.fp_weight = quantizer.W.clone()
+#             parent = dict(model.named_modules())[name.rsplit(".", 1)[0]]
+#             setattr(parent, name.rsplit(".", 1)[-1], qlinear)
+#     return model
