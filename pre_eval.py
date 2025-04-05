@@ -1,4 +1,5 @@
 # eval_gsm8k.py
+
 import torch
 import re
 import json
@@ -8,14 +9,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 from lora import inject_lora_layers
 from merge_lora import merge_lora_weights_into_base
-from gptq_quantizer import QuantizedLinear, quantize_model_weights
 from torch.utils.data import DataLoader
+from gptq_quantizer import QuantizedLinear
 
 SYSTEM_PROMPT = "You are a math expert who explains solutions step by step."
 QUESTION_TEMPLATE = "\n### Question:\n{question}\n\n### Answer:\n"
 
 def extract_answer(text):
-    match = re.search(r"The answer is (.*?)(\\.|$)", text)
+    match = re.search(r"The answer is (.*?)(\.|$)", text)
     return match.group(1).strip() if match else None
 
 def format_prompt(question):
@@ -23,6 +24,7 @@ def format_prompt(question):
 
 def run_eval(
     model_name_or_path,
+    quantized_ckpt_path,
     lora_ckpt_path,
     split="test",
     max_new_tokens=256,
@@ -36,33 +38,13 @@ def run_eval(
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=False)
     tokenizer.pad_token = tokenizer.eos_token
 
-    from datasets import load_dataset as hf_load_dataset
-    train_data = hf_load_dataset("gsm8k", "main", split="train[:5%]")
-    from torch.utils.data import Dataset
-
-    class PromptOnlyDataset(Dataset):
-        def __init__(self, examples):
-            self.examples = examples
-        def __len__(self):
-            return len(self.examples)
-        def __getitem__(self, idx):
-            return {
-                "input_ids": tokenizer(
-                    SYSTEM_PROMPT + QUESTION_TEMPLATE.format(question=self.examples[idx]["question"].strip()),
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=512,
-                    padding="max_length"
-                )["input_ids"].squeeze(0)
-            }
-
-    calibration_loader = DataLoader(PromptOnlyDataset(train_data), batch_size=2, shuffle=True)
-
+    # Load quantized base model and LoRA
     model = AutoModelForCausalLM.from_pretrained(model_name_or_path)
-    model = quantize_model_weights(model, calibration_loader, num_batches=10).to(device).half()
+    model.load_state_dict(torch.load(quantized_ckpt_path), strict=False)
     model = inject_lora_layers(model)
     model.load_state_dict(torch.load(lora_ckpt_path), strict=False)
     model = merge_lora_weights_into_base(model)
+    model = model.to(device).half()
     model.eval()
 
     raw_dataset = load_dataset("gsm8k", "main", split=split)
@@ -84,7 +66,7 @@ def run_eval(
             for _ in range(num_samples):
                 try:
                     outputs = model.generate(
-                        input_ids=input["input_ids"],  # safer generation
+                        input_ids=input["input_ids"],
                         attention_mask=input["attention_mask"],
                         do_sample=True,
                         top_p=top_p,
@@ -110,7 +92,6 @@ def run_eval(
                 if final == gold:
                     correct += 1
                 total += 1
-                print('TOTAL = ', total)
                 all_generations[q] = generations
 
             if total % 20 == 0:
@@ -127,6 +108,7 @@ def run_eval(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, required=True, help="Base model path")
+    parser.add_argument("--quant_ckpt", type=str, required=True, help="Path to quantized base model checkpoint")
     parser.add_argument("--lora_ckpt", type=str, required=True, help="Path to LoRA adapter")
     parser.add_argument("--split", type=str, default="test")
     parser.add_argument("--num_samples", type=int, default=5)
@@ -138,6 +120,7 @@ if __name__ == "__main__":
 
     run_eval(
         model_name_or_path=args.model,
+        quantized_ckpt_path=args.quant_ckpt,
         lora_ckpt_path=args.lora_ckpt,
         split=args.split,
         num_samples=args.num_samples,
