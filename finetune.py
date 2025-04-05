@@ -6,22 +6,62 @@ from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from lora import inject_lora_layers
 from gptq_quantizer import quantize_model_weights
-from dataset_loader import GSM8KCoTDataset
-import torch.nn.functional as F
+from dataset_loader import GSM8KCoTDataset, format_gsm8k_entry
+
 
 def train_lora_model(batch_size=2, epochs=1):
     model_name = "meta-llama/Llama-2-7b-hf"
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
     tokenizer.pad_token = tokenizer.eos_token
 
-    # Load and quantize
+    # Load and prepare model
     model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16)
     model.to("cuda")
-    
-    dataset = GSM8KCoTDataset(split="train", tokenizer=tokenizer)
-    dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
 
-    model = quantize_model_weights(model, dataloader)
+    # Load dataset for finetuning
+    class MaskedGSM8KDataset(GSM8KCoTDataset):
+        def _tokenize(self, ex):
+            encoded = self.tokenizer(
+                ex["prompt"], ex["target"],
+                truncation=True,
+                padding="max_length",
+                max_length=self.max_length,
+                return_tensors="pt"
+            )
+            encoded = {k: v.squeeze(0) for k, v in encoded.items()}
+            prompt_len = len(self.tokenizer(ex["prompt"], return_tensors="pt")["input_ids"].squeeze(0))
+            labels = encoded["input_ids"].clone()
+            labels[:prompt_len] = -100
+            encoded["labels"] = labels
+            return encoded
+
+    dataset = MaskedGSM8KDataset(split="train", tokenizer=tokenizer)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    # For calibration, create prompt-only loader
+    class PromptOnlyDataset(torch.utils.data.Dataset):
+        def __init__(self, examples):
+            self.examples = [format_gsm8k_entry(e)["prompt"] for e in examples]
+        def __len__(self):
+            return len(self.examples)
+        def __getitem__(self, idx):
+            return {
+                "input_ids": tokenizer(
+                    self.examples[idx],
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=512,
+                    padding="max_length"
+                )["input_ids"].squeeze(0)
+            }
+
+    from datasets import load_dataset
+    prompt_data = load_dataset("gsm8k", "main", split="train")
+    prompt_loader = DataLoader(PromptOnlyDataset(prompt_data), batch_size=2, shuffle=True)
+    model = quantize_model_weights(model, prompt_loader)
+    torch.save(model.state_dict(), "checkpoints/quantized_base_model.pt")
+    print("[Model quantization complete]")
+    
     model = inject_lora_layers(model)
 
     # Freeze everything except LoRA
@@ -35,7 +75,7 @@ def train_lora_model(batch_size=2, epochs=1):
 
     optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=5e-5)
 
-    for epoch in range(1):
+    for epoch in range(epochs):
         print(f"[Epoch {epoch+1}] Starting training...")
         epoch_loss = []
         for step, batch in enumerate(dataloader):
@@ -54,25 +94,23 @@ def train_lora_model(batch_size=2, epochs=1):
             optimizer.step()
             optimizer.zero_grad()
 
-            if step % 200 == 0:
+            if step % 500 == 0:
                 print(f"Step {step} | Loss: {loss.item():.4f}")
 
             epoch_loss.append(loss.item())
-        print('[Epoch {epoch+1}] Average Loss: {sum(epoch_loss)/len(epoch_loss):.4f}')
-        
+
+        print(f'[Epoch {epoch+1}] Average Loss: {sum(epoch_loss)/len(epoch_loss):.4f}')
 
     os.makedirs("checkpoints", exist_ok=True)
-    # torch.save(model.state_dict(), "checkpoints/lora_adapter.pt")
-    # Filter and save only LoRA parameters
     lora_state_dict = {k: v for k, v in model.state_dict().items() if "lora_" in k}
     torch.save(lora_state_dict, "checkpoints/lora_adapter.pt")
-
     print("[Training complete] Adapter saved.")
 
+
 if __name__ == "__main__":
-    # sample usage >>> python finetune.py --batch_size 2 --epochs 1
     parser = argparse.ArgumentParser(description="Quantize and Train LoRA model")
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size for training")
     parser.add_argument("--epochs", type=int, default=1, help="Number of epochs for training")
     args = parser.parse_args()
+
     train_lora_model(batch_size=args.batch_size, epochs=args.epochs)
