@@ -59,6 +59,13 @@ def train_lora_model(batch_size=2, epochs=1):
     prompt_data = load_dataset("gsm8k", "main", split="train")
     prompt_loader = DataLoader(PromptOnlyDataset(prompt_data), batch_size=2, shuffle=True)
     model = quantize_model_weights(model, prompt_loader)
+
+    for name, module in model.named_parameters():
+      print(name, module, type(module))
+
+    assert 1==0
+
+    os.makedirs("checkpoints", exist_ok=True)
     torch.save(model.state_dict(), "checkpoints/quantized_base_model.pt")
     print("[Model quantization complete]")
     
@@ -101,7 +108,7 @@ def train_lora_model(batch_size=2, epochs=1):
 
         print(f'[Epoch {epoch+1}] Average Loss: {sum(epoch_loss)/len(epoch_loss):.4f}')
 
-    os.makedirs("checkpoints", exist_ok=True)
+    
     lora_state_dict = {k: v for k, v in model.state_dict().items() if "lora_" in k}
     torch.save(lora_state_dict, "checkpoints/lora_adapter.pt")
     print("[Training complete] Adapter saved.")
