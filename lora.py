@@ -36,7 +36,7 @@ class LoRALinear(nn.Module):
 def inject_lora_layers(model, r=8, alpha=16):
     for name, module in model.named_modules():
         if name.endswith(("q_proj", "k_proj", "v_proj", "o_proj")) and isinstance(module, (nn.Linear, QuantizedLinear)):
-            print(f"[Injecting LoRA] {name}")
+            print(f"[Injecting LoRA] {name} | {type(module)}")
             lora_layer = LoRALinear(
                 module.in_features,
                 module.out_features,
@@ -46,9 +46,12 @@ def inject_lora_layers(model, r=8, alpha=16):
             )
 
             if hasattr(module, "fp_weight"):
+                print('fp_weight')
                 lora_layer.weight.data.copy_(module.fp_weight.to(torch.bfloat16))
-            else:
+            elif hasattr(module, "weight"):
                 lora_layer.weight.data.copy_(module.weight.data.to(torch.bfloat16))
+            else:
+                lora_layer.weight.data.copy_(module.weight_quant.data.to(torch.bfloat16))
 
             if module.bias is not None:
                 lora_layer.bias.data.copy_(module.bias.data.to(torch.bfloat16))

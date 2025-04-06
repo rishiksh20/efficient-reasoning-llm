@@ -100,7 +100,7 @@ def quantize_model_weights(model, dataloader, num_batches=10):
     print("[GPTQ] Starting full quantization...")
 
     for name, module in model.named_modules():
-        if isinstance(module, nn.Linear) and any(k in name for k in ["q_proj", "k_proj", "v_proj", "o_proj"]):
+        if isinstance(module, nn.Linear): #and any(k in name for k in ["q_proj", "k_proj", "v_proj", "o_proj"]):
             print(f"Quantizing {name}...")
             quantizer = GPTQQuantizer(module)
 
@@ -127,7 +127,7 @@ def quantize_model_weights(model, dataloader, num_batches=10):
                 qlinear.bias.data.copy_(module.bias.data)
 
             # Save original float weight for LoRA injection
-            qlinear.fp_weight = quantizer.W.clone()  # Save original W
+            # qlinear.fp_weight = quantizer.W.clone()  # Save original W
 
             # Replace original layer
             parent = dict(model.named_modules())[name.rsplit(".", 1)[0]]

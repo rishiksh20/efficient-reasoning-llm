@@ -5,7 +5,7 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from lora import inject_lora_layers
-from gptq_quantizer import quantize_model_weights
+from gptq_quantizer import quantize_model_weights, QuantizedLinear
 from dataset_loader import GSM8KCoTDataset, format_gsm8k_entry
 
 
@@ -60,10 +60,42 @@ def train_lora_model(batch_size=2, epochs=1):
     prompt_loader = DataLoader(PromptOnlyDataset(prompt_data), batch_size=2, shuffle=True)
     model = quantize_model_weights(model, prompt_loader)
 
-    for name, module in model.named_parameters():
-      print(name, module, type(module))
 
-    assert 1==0
+
+    for name, module in model.named_modules():
+        if isinstance(module, QuantizedLinear):
+            if hasattr(module, "fp_weight"):
+                del module.fp_weight
+            if hasattr(module, "scale"):
+                module.scale = module.scale.half()
+            if hasattr(module, "zero"):
+                module.zero = module.zero.half()
+            if hasattr(module, "weight"):
+                del module.weight  # From original nn.Linear
+            if hasattr(module, "bias") and module.bias is not None:
+                module.bias = module.bias.half()
+
+
+    print("\n[Model Diagnostic] Listing all parameters and buffers with size info...\n")
+    total_params = 0
+    total_buffers = 0
+    for name, param in model.named_parameters():
+        size = param.numel() * param.element_size()
+        total_params += size
+        print(f"[Param] {name} | dtype={param.dtype} | size={size/1e6:.2f} MB")
+
+    for name, buf in model.named_buffers():
+        size = buf.numel() * buf.element_size()
+        total_buffers += size
+        print(f"[Buffer] {name} | dtype={buf.dtype} | size={size/1e6:.2f} MB")
+
+    total = (total_params + total_buffers) / 1e6
+    print(f"\n[Summary] Total parameter size: {total_params/1e6:.2f} MB")
+    print(f"[Summary] Total buffer size:    {total_buffers/1e6:.2f} MB")
+    print(f"[Summary] TOTAL size:           {total:.2f} MB\n")
+
+
+    # assert 1==0
 
     os.makedirs("checkpoints", exist_ok=True)
     torch.save(model.state_dict(), "checkpoints/quantized_base_model.pt")
