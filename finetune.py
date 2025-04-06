@@ -129,6 +129,15 @@ def train_lora_model(batch_size=2, epochs=1):
                 print("Loss requires_grad:", loss.requires_grad)
                 print("Loss grad_fn:", loss.grad_fn)
 
+            for name, param in model.named_parameters():
+                if param.requires_grad and torch.isnan(param).any():
+                    print(f"[ERROR] NaN in param: {name}")
+
+            if torch.isnan(loss) or torch.isinf(loss):
+                print("[ERROR] NaN or Inf in loss!")
+                exit(1)
+
+
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()

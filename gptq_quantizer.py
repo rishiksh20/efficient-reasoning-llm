@@ -52,7 +52,8 @@ class GPTQQuantizer:
             W_min = proj.min(dim=1, keepdim=True)[0]
             W_max = proj.max(dim=1, keepdim=True)[0]
             scale = (W_max - W_min) / self.max_int
-            scale[scale == 0] = 1e-6
+            # scale[scale == 0] = 1e-6
+            scale = torch.clamp(scale, min=1e-3)
             zero = torch.round(-W_min / scale)
             W_q = torch.round(proj / scale + zero).clamp(0, self.max_int)
 
@@ -92,6 +93,9 @@ class QuantizedLinear(nn.Module):
         self.register_buffer("zero", zeros)
 
     def forward(self, x):
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            print("[Warning] Input contains NaNs or Infs before quantized matmul")
+
         return quant_matmul(x, self.weight_quant, self.scale, self.zero, bias=self.bias)
 
 
@@ -100,7 +104,7 @@ def quantize_model_weights(model, dataloader, num_batches=10):
     print("[GPTQ] Starting full quantization...")
 
     for name, module in model.named_modules():
-        if isinstance(module, nn.Linear): #and any(k in name for k in ["q_proj", "k_proj", "v_proj", "o_proj"]):
+        if isinstance(module, nn.Linear) and any(k in name for k in ["q_proj", "k_proj", "v_proj", "o_proj"]):
             print(f"Quantizing {name}...")
             quantizer = GPTQQuantizer(module)
 
