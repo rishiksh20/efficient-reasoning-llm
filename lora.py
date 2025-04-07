@@ -3,6 +3,18 @@ import torch.nn as nn
 import math
 
 
+def unpack_4bit(packed, scale, zero):
+    # packed: (out_features, in_features // 2), uint8
+    high = (packed >> 4) & 0xF
+    low = packed & 0xF
+
+    unpacked = torch.zeros(packed.size(0), packed.size(1) * 2, dtype=torch.float32, device=packed.device)
+    unpacked[:, 0::2] = low.float()
+    unpacked[:, 1::2] = high.float()
+
+    return (unpacked - zero) * scale
+
+
 class LoRALinear(nn.Module):
     def __init__(self, in_features, out_features, r=8, alpha=16, bias=True):
         super().__init__()
@@ -29,26 +41,33 @@ class LoRALinear(nn.Module):
         nn.init.zeros_(self.lora_B)
 
     def forward(self, x):
+        # print('LORA FWD----')
         if self.weight_quant is None or self.scale is None or self.zero is None:
             raise ValueError("Quantized weight, scale, and zero must be set before forward pass.")
 
-        # Dequantize weight to x.dtype
-        W = (self.weight_quant.float() - self.zero.float()) * self.scale.float()
-        W = W.to(dtype=x.dtype, device=x.device)
+        # Check for 4-bit vs 8-bit based on dimensions
+        if self.weight_quant.dtype == torch.uint8 and self.weight_quant.shape[1] * 2 == self.scale.numel():
+            # 4-bit packed quantization
+            unpacked = unpack_4bit(self.weight_quant, self.scale, self.zero)
+            W = unpacked.to(dtype=x.dtype, device=x.device)
+        else:
+            # 8-bit per-tensor or per-channel quantization
+            scale = self.scale
+            zero = self.zero
+            if scale.ndim == 1:
+                scale = scale[:, None].expand_as(self.weight_quant)
+            if zero.ndim == 1:
+                zero = zero[:, None].expand_as(self.weight_quant)
+
+            W = (self.weight_quant.float() - zero.float()) * scale.float()
+            W = W.to(dtype=x.dtype, device=x.device)
 
         bias = self.bias.to(dtype=x.dtype, device=x.device) if self.bias is not None else None
-
         base = torch.nn.functional.linear(x, W, bias)
 
         # LoRA path (in float32 for stability)
-        lora_out = torch.nn.functional.linear(
-            x.to(torch.float32),
-            self.lora_A
-        )
-        lora_out = torch.nn.functional.linear(
-            lora_out,
-            self.lora_B
-        )
+        lora_out = torch.nn.functional.linear(x.to(torch.float32), self.lora_A)
+        lora_out = torch.nn.functional.linear(lora_out, self.lora_B)
         lora_out = (self.scaling * lora_out).to(dtype=base.dtype)
 
         return base + lora_out
@@ -85,4 +104,3 @@ def inject_lora_layers(model, r=8, alpha=16):
             setattr(parent, attr_name, lora_layer)
 
     return model
-

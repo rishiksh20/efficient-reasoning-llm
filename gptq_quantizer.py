@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from quant_matmul import quant_matmul
 
 class GPTQQuantizer:
-    def __init__(self, layer, block_size=64, bits=8):
+    def __init__(self, layer, block_size=64, bits=4):
         self.layer = layer
         self.block_size = block_size
         self.bits = bits
@@ -25,57 +25,61 @@ class GPTQQuantizer:
     def compute_hessian(self):
         A = torch.cat(self.A, dim=0)
         self.H = (A.T @ A).float()
-        self.H += torch.eye(self.H.shape[0], device=self.device, dtype=torch.float32) * 1e-5  # Regularization
+        self.H += torch.eye(self.H.shape[0], device=self.device, dtype=torch.float32) * 1e-5
 
     def quantize(self):
         W = self.W
         H = self.H
         block_size = self.block_size
 
-        W_quant = torch.zeros_like(W)
-        scale_list = []
-        zero_list = []
+        if self.bits == 4:
+            W_quant = torch.zeros((W.shape[0], W.shape[1] // 2), dtype=torch.uint8, device=self.device)
+        else:
+            W_quant = torch.zeros_like(W, dtype=torch.uint8)
+
+        self.scales = torch.zeros(W.shape[0], dtype=torch.float16, device=self.device)
+        self.zeros = torch.zeros(W.shape[0], dtype=torch.float16, device=self.device)
 
         for i in range(0, W.shape[1], block_size):
             end = min(i + block_size, W.shape[1])
-            W_block = W[:, i:end]  # (out, block)
+            W_block = W[:, i:end]
 
-            # H_block = H[i:end, i:end]
             H_block = H[i:end, i:end].float()
             try:
                 H_inv = torch.linalg.inv(H_block)
             except:
                 H_inv = torch.pinverse(H_block)
 
-            proj = W_block @ H_inv @ H_block  # projection
+            proj = W_block @ H_inv @ H_block
 
             W_min = proj.min(dim=1, keepdim=True)[0]
             W_max = proj.max(dim=1, keepdim=True)[0]
             scale = (W_max - W_min) / self.max_int
-            # scale[scale == 0] = 1e-6
             scale = torch.clamp(scale, min=1e-3)
             zero = torch.round(-W_min / scale)
+
             W_q = torch.round(proj / scale + zero).clamp(0, self.max_int)
 
             dequant = (W_q - zero) * scale
             residual = W_block - dequant
 
-            # Backsolve error propagation
             if end < W.shape[1]:
                 W[:, end:] -= residual @ H[i:end, end:]
 
-            W_quant[:, i:end] = W_q
+            if self.bits == 4:
+                W_q = W_q.to(torch.uint8)
+                W_q_even = W_q[:, 0::2]
+                W_q_odd = W_q[:, 1::2]
+                packed = (W_q_even << 4) | W_q_odd
+                W_quant[:, i // 2:end // 2] = packed
+            else:
+                W_quant[:, i:end] = W_q.to(torch.uint8)
 
-            scale = scale.expand(-1, W_block.shape[1])
-            zero = zero.expand(-1, W_block.shape[1])
+            if i == 0:
+                self.scales.copy_(scale.squeeze().half())
+                self.zeros.copy_(zero.squeeze().half())
 
-            scale_list.append(scale)
-            zero_list.append(zero)
-
-        self.W_int8 = W_quant.to(torch.uint8)
-        self.scales = torch.cat(scale_list, dim=1)
-        self.zeros = torch.cat(zero_list, dim=1)
-
+        self.W_int8 = W_quant
         return self.W_int8, self.scales, self.zeros
 
 
@@ -95,7 +99,6 @@ class QuantizedLinear(nn.Module):
     def forward(self, x):
         if torch.isnan(x).any() or torch.isinf(x).any():
             print("[Warning] Input contains NaNs or Infs before quantized matmul")
-
         return quant_matmul(x, self.weight_quant, self.scale, self.zero, bias=self.bias)
 
 
@@ -113,12 +116,7 @@ def quantize_model_weights(model, dataloader, num_batches=10):
                 if count >= num_batches:
                     break
                 input_ids = batch["input_ids"].to(module.weight.device)
-
-
-                # with torch.no_grad():
                 hidden = model.model.embed_tokens(input_ids)
-
-
                 quantizer.add_batch(hidden)
                 count += 1
 
@@ -130,10 +128,6 @@ def quantize_model_weights(model, dataloader, num_batches=10):
             if module.bias is not None:
                 qlinear.bias.data.copy_(module.bias.data)
 
-            # Save original float weight for LoRA injection
-            # qlinear.fp_weight = quantizer.W.clone()  # Save original W
-
-            # Replace original layer
             parent = dict(model.named_modules())[name.rsplit(".", 1)[0]]
             setattr(parent, name.rsplit(".", 1)[-1], qlinear)
 

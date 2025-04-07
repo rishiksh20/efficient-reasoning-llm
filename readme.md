@@ -69,6 +69,10 @@ Steps:
 python eval_lora_gptq.py
 ```
 
+#### Current EM Accuracy
+
+![Alt text](image.png)
+
 ---
 
 ## Setup

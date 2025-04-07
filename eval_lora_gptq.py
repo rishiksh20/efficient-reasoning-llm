@@ -14,44 +14,15 @@ def evaluate_gsm8k():
 
     print("[Step] Loading base model...")
     model = AutoModelForCausalLM.from_pretrained(base_model_name, torch_dtype=torch.bfloat16)
-    model.to("cpu")
+    model.to("cuda")
 
 
-    # # For calibration, create prompt-only loader
-    # class PromptOnlyDataset(torch.utils.data.Dataset):
-    #     def __init__(self, examples):
-    #         self.examples = [format_gsm8k_entry(e)["prompt"] for e in examples]
-    #     def __len__(self):
-    #         return len(self.examples)
-    #     def __getitem__(self, idx):
-    #         return {
-    #             "input_ids": tokenizer(
-    #                 self.examples[idx],
-    #                 return_tensors="pt",
-    #                 truncation=True,
-    #                 max_length=512,
-    #                 padding="max_length"
-    #             )["input_ids"].squeeze(0)
-    #         }
-
-    # from datasets import load_dataset
-    # prompt_data = load_dataset("gsm8k", "main", split="train")
-    # prompt_loader = DataLoader(PromptOnlyDataset(prompt_data), batch_size=2, shuffle=True)
-    # model = quantize_model_weights(model, prompt_loader)
-
-
-
-
-    print("[Step] Preparing prompt loader for GPTQ calibration...")
-    prompt_data = load_dataset("gsm8k", "main", split="train")
-
+    # For calibration, create prompt-only loader
     class PromptOnlyDataset(torch.utils.data.Dataset):
         def __init__(self, examples):
-            self.examples = [ex["question"] for ex in examples]
-
+            self.examples = [format_gsm8k_entry(e)["prompt"] for e in examples]
         def __len__(self):
             return len(self.examples)
-
         def __getitem__(self, idx):
             return {
                 "input_ids": tokenizer(
@@ -63,10 +34,39 @@ def evaluate_gsm8k():
                 )["input_ids"].squeeze(0)
             }
 
-    prompt_loader = torch.utils.data.DataLoader(PromptOnlyDataset(prompt_data), batch_size=2)
-
-    print("[Step] Quantizing model with GPTQ...")
+    from datasets import load_dataset
+    prompt_data = load_dataset("gsm8k", "main", split="train")
+    prompt_loader = DataLoader(PromptOnlyDataset(prompt_data), batch_size=2, shuffle=True)
     model = quantize_model_weights(model, prompt_loader)
+
+
+
+
+    # print("[Step] Preparing prompt loader for GPTQ calibration...")
+    # prompt_data = load_dataset("gsm8k", "main", split="train")
+
+    # class PromptOnlyDataset(torch.utils.data.Dataset):
+    #     def __init__(self, examples):
+    #         self.examples = [ex["question"] for ex in examples]
+
+    #     def __len__(self):
+    #         return len(self.examples)
+
+    #     def __getitem__(self, idx):
+    #         return {
+    #             "input_ids": tokenizer(
+    #                 self.examples[idx],
+    #                 return_tensors="pt",
+    #                 truncation=True,
+    #                 max_length=512,
+    #                 padding="max_length"
+    #             )["input_ids"].squeeze(0)
+    #         }
+
+    # prompt_loader = torch.utils.data.DataLoader(PromptOnlyDataset(prompt_data), batch_size=2)
+
+    # print("[Step] Quantizing model with GPTQ...")
+    # model = quantize_model_weights(model, prompt_loader)
 
     
 
