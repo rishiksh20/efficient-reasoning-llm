@@ -92,9 +92,9 @@ Make sure your GPU supports `bfloat16` (LLaMA 2 models expect bf16 or fp16).
 ---
 
 ## Notes
-- Only attention projections (`q_proj`, `k_proj`, `v_proj`, `o_proj`) are quantized to 8-bit.
+- Only attention projections (`q_proj`, `k_proj`, `v_proj`, `o_proj`) are quantized to 4-bit.
 - LoRA is injected after quantization for accurate weight merging.
-- Final accuracy on GSM8K test set is around **70.05%**, which is competitive with several published low-bit baselines.
+- Final accuracy on GSM8K test set is around **73.09%**, which is competitive with several published low-bit baselines.
 
 ---
 
